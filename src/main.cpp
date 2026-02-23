@@ -211,10 +211,35 @@ int main(int argc, char** argv) {
         galaxy_particles[i].vy = radius; // store original radius
         galaxy_particles[i].vz = ((float)rand() / RAND_MAX) * M_PI * 2.0f; // random phase
     }
+    // Setup for Straight Line Grid (Mode 1 Replacement)
+    int num_lines = 150;
+    int points_per_line = 300;
+    int total_grid_particles = num_lines * points_per_line;
+    Particle* grid_particles = (Particle*)calloc(total_grid_particles, sizeof(Particle));
+    
+    // Create a 2D plane grid of straight horizontal lines
+    float grid_size_x = 420.0f;
+    float grid_size_z = 420.0f;
+    
+    for (int l = 0; l < num_lines; ++l) {
+        float z = -grid_size_z/2.0f + ((float)l / (num_lines - 1)) * grid_size_z;
+        for (int p = 0; p < points_per_line; ++p) {
+            float x = -grid_size_x/2.0f + ((float)p / (points_per_line - 1)) * grid_size_x;
+            int idx = l * points_per_line + p;
+            
+            grid_particles[idx].x = x;
+            grid_particles[idx].y = 0.0f; 
+            grid_particles[idx].z = z;
+            grid_particles[idx].vx = 0.0f;         // Unused
+            grid_particles[idx].vy = 0.0f;         // Unused
+            grid_particles[idx].vz = 0.0f;         // Spring velocity
+            grid_particles[idx].life = 0.0f;       // Unused
+        }
+    }
 
     const char* mode_names[] = {
         "CUDA Music Player - Mode 0: Stereo Logarithmic Bar EQ",
-        "CUDA Music Player - Mode 1: Radial EQ",
+        "CUDA Music Player - Mode 1: [3D] Particle Ring Vibrator",
         "CUDA Music Player - Mode 2: The Chromagram",
         "CUDA Music Player - Mode 3: Spectrogram Waterfall",
         "CUDA Music Player - Mode 4: The Oscilloscope (Vectorscope)",
@@ -369,77 +394,156 @@ int main(int argc, char** argv) {
                 }
                 glEnd();
             } else if (current_mode_index == MODE_RADIAL) {
-                // =============== RADIAL VISUALIZER ===============
-                int center_x = window_width / 2;
-                int center_y = window_height / 2;
-                float base_radius = window_height * 0.15f;
+                // =============== [3D] PARTICLE RING VIBRATOR (Refined with Physics) ===============
+                glMatrixMode(GL_PROJECTION); glLoadIdentity();
+                // Lower FOV for a more cinematic, deep look
+                gluPerspective(50.0f, (float)window_width / (float)window_height, 0.1f, 1500.0f);
                 
-                glBegin(GL_LINES);
-                // We map frequencies around a circle
-                for (int band = 0; band < display_bands; ++band) {
-                    // Average the stereo channels if we want a single circle, 
-                    // or we could draw two circles. Let's average for a unified starburst effect.
-                    float mag_left = magnitudes[band * num_channels + 0];
-                    float mag_right = magnitudes[band * num_channels + (num_channels > 1 ? 1 : 0)];
-                    float avg_mag = (mag_left + mag_right) / 2.0f;
-                    
-                    // Map band index to an angle (using both sides of the circle symmetrically)
-                    for(int side = 0; side < 2; ++side) {
-                        float angle;
-                        if (side == 0) { // Right half (0 to PI)
-                            angle = ((float)band / display_bands) * M_PI - (M_PI/2.0f); // -90 deg to 90 deg
-                        } else {         // Left half (PI to 2PI)
-                            angle = M_PI + ((float)(display_bands - 1 - band) / display_bands) * M_PI - (M_PI/2.0f);
-                        }
-                        
-                        float extension = avg_mag * 1.5f; // How far the spike reaches
-                        if (extension > window_height * 0.4f) extension = window_height * 0.4f; // Cap
-                        
-                        float current_radius = base_radius + extension;
-                        
-                        // Calculate endpoints
-                        int x1 = center_x + (int)(cosf(angle) * base_radius);
-                        int y1 = center_y + (int)(sinf(angle) * base_radius);
-                        int x2 = center_x + (int)(cosf(angle) * current_radius);
-                        int y2 = center_y + (int)(sinf(angle) * current_radius);
-                        
-                        // Color radially (Inner=Red/Bass, Outer=Blue/Treble)
-                        Uint8 r = 255 - ((band * 255) / display_bands);
-                        Uint8 b = (band * 255) / display_bands;
-                        glColor3ub(r, 100, b);
-                        
-                        // RenderLine is thin, so we draw a tiny grouping
-                        for(int w = -1; w <= 1; ++w) {
-                             glVertex2f(x1+w, y1);
-                             glVertex2f(x2+w, y2);
-                             glVertex2f(x1, y1+w);
-                             glVertex2f(x2, y2+w);
-                        }
-                    }
-                }
-                glEnd();
+                glMatrixMode(GL_MODELVIEW); glLoadIdentity();
                 
-                // Draw center beat circle (pulsing to overall bass)
+                // Audio analysis for Global parameters
                 float bass_sum = 0;
-                for(int i=0; i<5; i++) {
-                     bass_sum += magnitudes[i * num_channels + 0] + magnitudes[i * num_channels + (num_channels > 1 ? 1 : 0)];
-                }
-                float pulse = bass_sum / 10.0f;
-                int inner_radius = (int)(base_radius * 0.8f + pulse);
+                float current_frame_max = 0.0f;
                 
-                glColor3ub(255, 50, 100);
-                glBegin(GL_POINTS);
-                // Draw a simple circle manually for the glowing center
-                for (int w = 0; w < inner_radius * 2; w++) {
-                    for (int h = 0; h < inner_radius * 2; h++) {
-                        int dx = inner_radius - w;
-                        int dy = inner_radius - h;
-                        if ((dx*dx + dy*dy) <= (inner_radius * inner_radius)) {
-                            glVertex2f(center_x + dx, center_y + dy);
-                        }
-                    }
+                for(int i = 0; i < 5; ++i) {
+                    float mag = (magnitudes[i * num_channels + 0] + magnitudes[i * num_channels + (num_channels>1?1:0)]) / 2.0f;
+                    bass_sum += mag;
+                    if (mag > current_frame_max) current_frame_max = mag;
                 }
-                glEnd();
+                float mid_sum = 0;
+                for(int i=20; i<40; ++i) {
+                     float mag = (magnitudes[i * num_channels + 0] + magnitudes[i * num_channels + (num_channels>1?1:0)]) / 2.0f;
+                     mid_sum += mag;
+                     if (mag > current_frame_max) current_frame_max = mag;
+                }
+                
+                // Check all bands for AGC
+                for (int i=0; i<display_bands; ++i) {
+                    float mag = (magnitudes[i * num_channels + 0] + magnitudes[i * num_channels + (num_channels>1?1:0)]) / 2.0f;
+                    if (mag > current_frame_max) current_frame_max = mag;
+                }
+                
+                // AGC Logic (Automatic Gain Control)
+                static float rolling_peak = 1.0f;
+                if (current_frame_max > rolling_peak) {
+                    rolling_peak = current_frame_max; // Instant rise for punch
+                } else {
+                    rolling_peak *= 0.995f; // Smooth decay back down
+                    if (rolling_peak < 1.0f) rolling_peak = 1.0f; // Minimum floor to prevent amplifying silence
+                }
+                
+                // Calculate dynamic scale factor
+                float target_peak = 2.0f; // Aesthetically pleasing target max magnitude
+                float dynamic_scale_factor = target_peak / rolling_peak;
+                
+                // Scale global trackers
+                bass_sum *= dynamic_scale_factor;
+                mid_sum *= dynamic_scale_factor;
+                
+                // Position Camera lower and looking across the horizon for depth
+                static float ring_cam_rot = 0;
+                ring_cam_rot += 0.10f; // Smooth, slow pan
+                
+                // Keep the camera stable, only subtle bumping
+                float cam_dist = 260.0f + (bass_sum * 1.5f); 
+                
+                gluLookAt(sinf(ring_cam_rot * 0.01f) * cam_dist, 60.0f - (bass_sum * 1.0f), cosf(ring_cam_rot * 0.01f) * cam_dist, 
+                          0.0f, -20.0f, 0.0f, 
+                          0.0f, 1.0f, 0.0f);
+
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE); // Additive glowing blending
+                glEnable(GL_LINE_SMOOTH); 
+                glLineWidth(1.5f);
+
+                // Time factor for standing waves
+                float t = SDL_GetTicks() * 0.003f;
+                
+                // --- GRID WITH FLUID PHYSICS (Lines) ---
+                for (int l = 0; l < num_lines; ++l) {
+                    glBegin(GL_LINE_STRIP);
+                    for (int p = 0; p < points_per_line; ++p) {
+                        int i = l * points_per_line + p;
+                        Particle* pt = &grid_particles[i];
+                        
+                        // Radial Audio Displacement:
+                        float radius = sqrtf(pt->x * pt->x + pt->z * pt->z);
+                        
+                        // Max expected radius is roughly 300
+                        float max_radius_for_freq = 280.0f;
+                        int band = (int)((radius / max_radius_for_freq) * display_bands);
+                        if (band >= display_bands) band = display_bands - 1;
+                        if (band < 0) band = 0;
+                        
+                        // mapped history: the wave moves outwards from the center over time
+                        int history_idx = (int)((radius / max_radius_for_freq) * mountain_depth);
+                        if (history_idx < 0) history_idx = 0;
+                        if (history_idx >= mountain_depth) history_idx = mountain_depth - 1;
+                        
+                        float mag = (mountain_history[history_idx][band * num_channels + 0] + 
+                                     mountain_history[history_idx][band * num_channels + (num_channels>1?1:0)]) / 2.0f;
+                        
+                        // Apply AGC Dynamic Scale
+                        mag *= dynamic_scale_factor;
+                                     
+                        // Deep funnel valley shape
+                        float norm_r = radius / max_radius_for_freq;
+                        if (norm_r > 1.0f) norm_r = 1.0f;
+                        float bowl_shape = (powf(norm_r, 3.0f) * 120.0f) - 60.0f; 
+
+                        // Smooth cone displacement based on bass
+                        float cone_displacement = 0.0f;
+                        if (radius < 100.0f) {
+                           cone_displacement = bass_sum * (100.0f - radius) * 0.4f; 
+                        }
+                        
+                        // Controlled Ripples
+                        float ripple_height = mag * 50.0f; 
+                        
+                        // Subtle standing wave 
+                        float standing_wave = sinf(radius * 0.1f - t) * (norm_r) * mag * 8.0f;
+
+                        float target_y = bowl_shape + cone_displacement + ripple_height + standing_wave;
+
+                        // SPRING PHYSICS
+                        float stiffness = 0.2f; 
+                        float damping = 0.80f;
+                        
+                        pt->vz += (target_y - pt->y) * stiffness; 
+                        pt->vz *= damping;
+                        pt->y += pt->vz;
+
+                        // Clean, Silver/White aesthetic
+                        float intensity = mag * 1.5f + 0.15f;
+                        if (intensity > 1.0f) intensity = 1.0f;
+                        
+                        Uint8 col_r = (Uint8)(255 * intensity);
+                        Uint8 col_g = (Uint8)(255 * intensity);
+                        Uint8 col_b = (Uint8)(255 * intensity);
+
+                        if (intensity < 0.25f) {
+                             col_r *= 0.7f;
+                             col_g *= 0.8f;
+                        }
+
+                        // Strict Red transitions: ONLY for the highest peaks
+                        if (pt->y > 20.0f && radius > 150.0f) {
+                            float peak_factor = (pt->y - 20.0f) / 40.0f; 
+                            if (peak_factor > 1.0f) peak_factor = 1.0f;
+                            
+                            col_r = 255;
+                            col_g = (Uint8)(255 * (1.0f - peak_factor)); 
+                            col_b = (Uint8)(255 * (1.0f - peak_factor));
+                        }
+                        
+                        glColor4ub(col_r, col_g, col_b, (Uint8)(intensity * 255));
+                        glVertex3f(pt->x, pt->y, pt->z);
+                    }
+                    glEnd();
+                }
+                
+                glDisable(GL_BLEND);
+                glDisable(GL_LINE_SMOOTH);
             } else if (current_mode_index == MODE_CHROMAGRAM) {
                 // =============== CHROMAGRAM VISUALIZER ===============
                 compute_chromagram(&audio_data.audio_data[sample_offset], num_frames_per_chunk, num_channels, chromagram, &chroma_pitches);
@@ -831,6 +935,7 @@ int main(int argc, char** argv) {
     free(chromagram);
     free(particles);
     free(galaxy_particles);
+    free(grid_particles); // Added missing free for Mode 1
     
     for (int i=0; i<mountain_depth; i++) free(mountain_history[i]);
     free(mountain_history);

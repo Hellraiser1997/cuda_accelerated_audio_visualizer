@@ -7,6 +7,19 @@
 // Instead of returning thousands of linear bins, this groups them logarithmically
 // which perfectly aligns with human hearing (more detail in bass, groupings in treble).
 __global__ void compute_stereo_dft_log_bands(const int16_t* d_audio, float* d_magnitudes, int num_frames, int num_channels, int display_bands, float sample_rate) {
+    extern __shared__ int16_t s_audio[];
+    
+    // Cooperative memory load
+    int total_samples = num_frames * num_channels;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    
+    for (int i = tid; i < total_samples; i += stride) {
+        s_audio[i] = d_audio[i];
+    }
+    
+    __syncthreads(); // Wait until the entire audio chunk is built in shared cache
+
     int band = blockIdx.x * blockDim.x + threadIdx.x;
     
     if (band < display_bands) {
@@ -42,16 +55,20 @@ __global__ void compute_stereo_dft_log_bands(const int16_t* d_audio, float* d_ma
                 for (int n = 0; n < num_frames; ++n) {
                     float angle = 2.0f * 3.1415926535f * k * n / num_frames;
                     
-                    // Extract the correct interleaved sample
-                    int sample_idx = n * num_channels + ch;
-                    float sample = d_audio[sample_idx] / 32768.0f; 
+                    // Hardware intrinsic math for simultaneous sin/cos execution
+                    float s_val, c_val;
+                    __sincosf(angle, &s_val, &c_val);
                     
-                    // Apply a Hann window function to reduce spectral leakage
+                    // Extract the sample from ultra-fast shared memory cache
+                    int sample_idx = n * num_channels + ch;
+                    float sample = s_audio[sample_idx] / 32768.0f; 
+                    
+                    // Apply Hann window
                     float window = 0.5f * (1.0f - cosf(2.0f * 3.1415926535f * n / (num_frames - 1)));
                     sample *= window;
                     
-                    real_sum += sample * cosf(angle);
-                    imag_sum -= sample * sinf(angle);
+                    real_sum += sample * c_val;
+                    imag_sum -= sample * s_val;
                 }
                 
                 float magnitude = sqrtf(real_sum * real_sum + imag_sum * imag_sum);
@@ -92,7 +109,7 @@ bool init_gpu_dsp() {
 
 // display_bands controls how many physical bars the visualizer will have.
 // We can hardcode this to 80 for now since the GUI expects 80.
-#define DISPLAY_BANDS 80
+#define DISPLAY_BANDS 512
 
 bool process_audio_chunk(const int16_t* audio_data, uint32_t num_frames, uint16_t num_channels, float* out_magnitudes, uint32_t* out_num_bands) {
     if (!audio_data || !out_magnitudes || num_frames == 0 || num_channels < 1 || num_channels > 2) return false;
@@ -121,7 +138,8 @@ bool process_audio_chunk(const int16_t* audio_data, uint32_t num_frames, uint16_
     int numBlocks = (DISPLAY_BANDS + blockSize - 1) / blockSize;
     
     // Sample rate is fixed to 44100 for our math currently based on WAV parser expectations
-    compute_stereo_dft_log_bands<<<numBlocks, blockSize>>>(d_audio_buffer_bands, d_magnitude_buffer_bands, num_frames, num_channels, DISPLAY_BANDS, 44100.0f);
+    size_t shared_mem_size = num_frames * num_channels * sizeof(int16_t);
+    compute_stereo_dft_log_bands<<<numBlocks, blockSize, shared_mem_size>>>(d_audio_buffer_bands, d_magnitude_buffer_bands, num_frames, num_channels, DISPLAY_BANDS, 44100.0f);
     
     // Wait for GPU to finish
     cudaDeviceSynchronize();
@@ -139,6 +157,19 @@ bool process_audio_chunk(const int16_t* audio_data, uint32_t num_frames, uint16_
 
 // Computes the 12 chromatic pitches across multiple octaves
 __global__ void compute_stereo_chromagram(const int16_t* d_audio, float* d_chroma, int num_frames, int num_channels, float sample_rate) {
+    extern __shared__ int16_t s_audio_chroma[];
+    
+    // Cooperative memory load
+    int total_samples = num_frames * num_channels;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    
+    for (int i = tid; i < total_samples; i += stride) {
+        s_audio_chroma[i] = d_audio[i];
+    }
+    
+    __syncthreads();
+
     // 12 pitch classes (0 = C, 1 = C#, 2 = D ... 11 = B)
     int pitch_class = blockIdx.x * blockDim.x + threadIdx.x;
     
@@ -174,14 +205,18 @@ __global__ void compute_stereo_chromagram(const int16_t* d_audio, float* d_chrom
                     // Direct DFT for this specific frequency bin
                     for (int n = 0; n < num_frames; ++n) {
                         float angle = 2.0f * 3.1415926535f * k * n / num_frames;
-                        float sample = d_audio[n * num_channels + ch] / 32768.0f; 
+                        
+                        float s_val, c_val;
+                        __sincosf(angle, &s_val, &c_val);
+                        
+                        float sample = s_audio_chroma[n * num_channels + ch] / 32768.0f; 
                         
                         // Hann window
                         float window = 0.5f * (1.0f - cosf(2.0f * 3.1415926535f * n / (num_frames - 1)));
                         sample *= window;
                         
-                        real_sum += sample * cosf(angle);
-                        imag_sum -= sample * sinf(angle);
+                        real_sum += sample * c_val;
+                        imag_sum -= sample * s_val;
                     }
                     
                     float magnitude = sqrtf(real_sum * real_sum + imag_sum * imag_sum);
@@ -223,8 +258,8 @@ bool compute_chromagram(const int16_t* audio_data, uint32_t num_frames, uint16_t
 
     int blockSize = 12; // One block of 12 threads for the 12 pitches is enough
     int numBlocks = 1;
-    
-    compute_stereo_chromagram<<<numBlocks, blockSize>>>(d_audio_buffer_chroma, d_chroma_buffer, num_frames, num_channels, 44100.0f);
+    size_t shared_mem_size = num_frames * num_channels * sizeof(float);
+    compute_stereo_chromagram<<<numBlocks, blockSize, shared_mem_size>>>(d_audio_buffer_chroma, d_chroma_buffer, num_frames, num_channels, 44100.0f);
     
     cudaDeviceSynchronize();
 
