@@ -67,6 +67,15 @@ enum VisMode {
     MODE_COUNT = 10           // Determines wrap limit
 };
 
+// Struct for Mode 2: Stereo Positional Ripples
+typedef struct {
+    float pan_x;      // Stereo position (0.0 Left ... 1.0 Right)
+    float radius;     // Expanding radius of the ripple
+    float intensity;  // How hard the wave hit
+    float life;       // 1.0 down to 0.0 fade out
+    bool active;
+} Ripple;
+
 // Physics struct for Volumetric Audio Clouds
 struct Particle {
     float x, y, z;
@@ -242,7 +251,7 @@ int main(int argc, char** argv) {
     const char* mode_names[] = {
         "CUDA Music Player - Mode 0: Stereo Logarithmic Bar EQ",
         "CUDA Music Player - Mode 1: [3D] Particle Ring Vibrator",
-        "CUDA Music Player - Mode 2: The Chromagram",
+        "CUDA Music Player - Mode 2: Stereo Positional Waves (Digital Pond)",
         "CUDA Music Player - Mode 3: Spectrogram Waterfall",
         "CUDA Music Player - Mode 4: The Oscilloscope (Vectorscope)",
         "CUDA Music Player - Mode 5: Phase Space Attractor",
@@ -552,37 +561,105 @@ int main(int argc, char** argv) {
                 
                 glDisable(GL_BLEND);
                 glDisable(GL_POINT_SMOOTH);
+                glDisable(GL_BLEND);
+                glDisable(GL_POINT_SMOOTH);
             } else if (current_mode_index == MODE_CHROMAGRAM) {
-                // =============== CHROMAGRAM VISUALIZER ===============
-                compute_chromagram(&audio_data.audio_data[sample_offset], num_frames_per_chunk, num_channels, chromagram, &chroma_pitches);
+                // =============== MODE 2: STEREO POSITIONAL WAVES (Digital Pond) ===============
+                // Replaced Chromagram with the Positional Wave matrix
+                glMatrixMode(GL_PROJECTION); glLoadIdentity(); gluOrtho2D(0, window_width, window_height, 0);
+                glMatrixMode(GL_MODELVIEW); glLoadIdentity();
                 
-                int bar_width = window_width / 12;
-                int padding = 5;
-                const char* note_names[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+                // Static array of ripples to manage the physics of the pond
+                #define MAX_RIPPLES 100
+                static Ripple ripples[MAX_RIPPLES] = {0};
                 
-                glBegin(GL_QUADS);
-                for (int pitch = 0; pitch < 12; ++pitch) {
-                    float mag = chromagram[pitch * num_channels + 0] + (num_channels > 1 ? chromagram[pitch * num_channels + 1] : 0);
-                    mag /= 2.0f; 
+                // 1. Spawning Logic: Analyze audio and drop new ripples
+                int num_macro_bands = 16;
+                int bands_per_macro = display_bands / num_macro_bands;
+                
+                for (int m = 0; m < num_macro_bands; ++m) {
+                    float sum_L = 0;
+                    float sum_R = 0;
                     
-                    int h = (int)(mag * window_height * 0.8f);
-                    if (h > window_height - 50) h = window_height - 50;
-                    if (h < 5) h = 5;
+                    // Sum energy in this macro band to prevent chaotic overlapping
+                    for (int b = 0; b < bands_per_macro; ++b) {
+                        int actual_band = m * bands_per_macro + b;
+                        // Magnitudes are interleaved [L, R, L, R...]
+                        sum_L += magnitudes[actual_band * num_channels + 0];
+                        if (num_channels > 1) {
+                            sum_R += magnitudes[actual_band * num_channels + 1];
+                        } else {
+                            sum_R += magnitudes[actual_band * num_channels + 0]; // fallback to mono
+                        }
+                    }
                     
-                    Uint8 r = (sin(pitch * 0.523) + 1.0) * 127;  
-                    Uint8 g = (sin(pitch * 0.523 + 2.09) + 1.0) * 127; 
-                    Uint8 b = (sin(pitch * 0.523 + 4.18) + 1.0) * 127; 
+                    float total_energy = sum_L + sum_R;
                     
-                    glColor3ub(r, g, b);
-                    int x = pitch * bar_width + padding;
-                    int y = window_height - h - 30;
-                    int bw = bar_width - (padding * 2);
-                    glVertex2f(x, y + h);
-                    glVertex2f(x + bw, y + h);
-                    glVertex2f(x + bw, y);
-                    glVertex2f(x, y);
+                    // If there's a strong beat in this macro band, drop a ripple!
+                    if (total_energy > 0.8f) { 
+                        float pan_x = (total_energy > 0.001f) ? (sum_R / total_energy) : 0.5f;
+                        
+                        // Find a dead ripple slot to recycle
+                        for (int i = 0; i < MAX_RIPPLES; ++i) {
+                            if (!ripples[i].active) {
+                                ripples[i].active = true;
+                                ripples[i].pan_x = pan_x;
+                                ripples[i].radius = 1.0f;
+                                ripples[i].life = 1.0f;
+                                ripples[i].intensity = total_energy;
+                                break;
+                            }
+                        }
+                    }
                 }
-                glEnd();
+                
+                // 2. Physics & Rendering Logic
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE); // Glowing additive blend
+                glEnable(GL_LINE_SMOOTH);
+                glLineWidth(2.0f);
+                
+                for (int i = 0; i < MAX_RIPPLES; ++i) {
+                    if (ripples[i].active) {
+                        // Expand the circle based on how hard it hit
+                        ripples[i].radius += ripples[i].intensity * 5.0f + 2.0f;
+                        ripples[i].life -= 0.02f; // Fade out gradually
+                        
+                        if (ripples[i].life <= 0.0f || ripples[i].radius > window_width) {
+                            ripples[i].active = false;
+                            continue;
+                        }
+                        
+                        // Map the physical 0.0-1.0 stereo pan to the X-axis of the screen
+                        float center_x = ripples[i].pan_x * window_width;
+                        float center_y = window_height / 2.0f; // Drops hit the center line (Y-axis)
+                        
+                        // Calculate color based on Life and Intensity
+                        Uint8 alpha = (Uint8)(ripples[i].life * 200.0f);
+                        if (alpha > 255) alpha = 255;
+                        
+                        // Let's color code it. Left = Cyan, Center = White, Right = Magenta
+                        Uint8 r = (Uint8)(ripples[i].pan_x * 255);
+                        Uint8 g = (Uint8)((1.0f - fabs(ripples[i].pan_x - 0.5f) * 2.0f) * 200) + 55;
+                        Uint8 b = (Uint8)((1.0f - ripples[i].pan_x) * 255);
+                        
+                        glColor4ub(r, g, b, alpha);
+                        
+                        // Draw the expanding circular ripple (Using a Line Loop)
+                        glBegin(GL_LINE_LOOP);
+                        int num_segments = 60;
+                        for (int seg = 0; seg < num_segments; ++seg) {
+                            float theta = 2.0f * 3.1415926f * (float)seg / (float)num_segments;
+                            float x = center_x + ripples[i].radius * cosf(theta);
+                            float y = center_y + ripples[i].radius * sinf(theta);
+                            glVertex2f(x, y);
+                        }
+                        glEnd();
+                    }
+                }
+                
+                glDisable(GL_BLEND);
+                glDisable(GL_LINE_SMOOTH);
                 
             } else if (current_mode_index == MODE_SPECTROGRAM) {
                 // =============== SPECTROGRAM (Orthographic Waterfall) ===============
