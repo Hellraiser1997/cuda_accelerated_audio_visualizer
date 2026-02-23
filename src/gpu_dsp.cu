@@ -24,9 +24,9 @@ __global__ void compute_stereo_dft_log_bands(const int16_t* d_audio, float* d_ma
     
     if (band < display_bands) {
         
-        // Logarithmic frequency bounds for this specific "Band" (e.g., 20Hz to 20,000Hz)
+        // Logarithmic frequency bounds for this specific "Band" (e.g., 20Hz to 16,000Hz)
         float min_freq = 20.0f;
-        float max_freq = sample_rate / 2.0f; // Nyquist
+        float max_freq = 16000.0f; // Constrain to active musical spectrum rather than full Nyquist
         
         // Calculate the frequency range this band represents using log10
         float log_min = log10f(min_freq);

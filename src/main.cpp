@@ -12,6 +12,8 @@ extern "C" {
 }
 #include "gpu_dsp.h"
 
+#define MAX_DISPLAY_BANDS 512
+
 // Helper to draw text via OpenGL Textures for Stats For Nerds HUD
 void render_text_ortho(const char* text, float x, float y, TTF_Font* font, SDL_Color color, int win_w, int win_h) {
     if (!text || !font) return;
@@ -170,21 +172,21 @@ int main(int argc, char** argv) {
     printf("Starting playback...\n");
     start_playback(&player);
 
-    uint32_t num_frames_per_chunk = 2048; // High resolution sampling window
+    uint32_t num_frames_per_chunk = 8192; // Ultra High resolution sampling window
     uint16_t num_channels = audio_data.header.num_channels;
     
     // Arrays for the GPU to return data into. 
-    float* magnitudes = (float*)malloc(200 * 2 * sizeof(float)); 
+    float* magnitudes = (float*)malloc(MAX_DISPLAY_BANDS * 2 * sizeof(float)); 
     uint32_t display_bands_returned;
     
     float* chromagram = (float*)malloc(12 * 2 * sizeof(float));
     uint32_t chroma_pitches;
     
-    // Setup for 3D Mountain Range Buffer (100 frames deep x DISPLAY_BANDS wide x 2 channels)
+    // Setup for 3D Mountain Range Buffer (100 frames deep x MAX_DISPLAY_BANDS wide x 2 channels)
     int mountain_depth = 100;
     float** mountain_history = (float**)malloc(mountain_depth * sizeof(float*));
     for (int i=0; i<mountain_depth; ++i) {
-        mountain_history[i] = (float*)calloc(200 * 2, sizeof(float));
+        mountain_history[i] = (float*)calloc(MAX_DISPLAY_BANDS * 2, sizeof(float));
     }
     
     // Setup for Volumetric Particle Cloud
@@ -212,14 +214,14 @@ int main(int argc, char** argv) {
         galaxy_particles[i].vz = ((float)rand() / RAND_MAX) * M_PI * 2.0f; // random phase
     }
     // Setup for Straight Line Grid (Mode 1 Replacement)
-    int num_lines = 150;
-    int points_per_line = 300;
+    int num_lines = 600;
+    int points_per_line = 1200;
     int total_grid_particles = num_lines * points_per_line;
     Particle* grid_particles = (Particle*)calloc(total_grid_particles, sizeof(Particle));
     
     // Create a 2D plane grid of straight horizontal lines
-    float grid_size_x = 420.0f;
-    float grid_size_z = 420.0f;
+    float grid_size_x = 900.0f;
+    float grid_size_z = 900.0f;
     
     for (int l = 0; l < num_lines; ++l) {
         float z = -grid_size_z/2.0f + ((float)l / (num_lines - 1)) * grid_size_z;
@@ -405,13 +407,13 @@ int main(int argc, char** argv) {
                 float bass_sum = 0;
                 float current_frame_max = 0.0f;
                 
-                for(int i = 0; i < 5; ++i) {
+                for(int i = 0; i < (int)(display_bands * (5.0f/80.0f)); ++i) {
                     float mag = (magnitudes[i * num_channels + 0] + magnitudes[i * num_channels + (num_channels>1?1:0)]) / 2.0f;
                     bass_sum += mag;
                     if (mag > current_frame_max) current_frame_max = mag;
                 }
                 float mid_sum = 0;
-                for(int i=20; i<40; ++i) {
+                for(int i=(int)(display_bands * 0.25f); i<(int)(display_bands * 0.5f); ++i) {
                      float mag = (magnitudes[i * num_channels + 0] + magnitudes[i * num_channels + (num_channels>1?1:0)]) / 2.0f;
                      mid_sum += mag;
                      if (mag > current_frame_max) current_frame_max = mag;
@@ -444,24 +446,26 @@ int main(int argc, char** argv) {
                 static float ring_cam_rot = 0;
                 ring_cam_rot += 0.10f; // Smooth, slow pan
                 
-                // Keep the camera stable, only subtle bumping
-                float cam_dist = 260.0f + (bass_sum * 1.5f); 
+                // Keep the camera stable, only subtle bumping, moved closer to the grid for depth.
+                float cam_dist = 180.0f + (bass_sum * 1.5f); 
                 
-                gluLookAt(sinf(ring_cam_rot * 0.01f) * cam_dist, 60.0f - (bass_sum * 1.0f), cosf(ring_cam_rot * 0.01f) * cam_dist, 
-                          0.0f, -20.0f, 0.0f, 
+                gluLookAt(sinf(ring_cam_rot * 0.01f) * cam_dist, 35.0f - (bass_sum * 1.0f), cosf(ring_cam_rot * 0.01f) * cam_dist, 
+                          0.0f, -10.0f, 0.0f, 
                           0.0f, 1.0f, 0.0f);
 
                 glEnable(GL_BLEND);
                 glBlendFunc(GL_SRC_ALPHA, GL_ONE); // Additive glowing blending
-                glEnable(GL_LINE_SMOOTH); 
-                glLineWidth(1.5f);
+                
+                // Massive Geometry Bloom setup
+                glEnable(GL_POINT_SMOOTH); 
+                glPointSize(1.0f); // Minimum pixel size for maximum point density
 
                 // Time factor for standing waves
                 float t = SDL_GetTicks() * 0.003f;
                 
                 // --- GRID WITH FLUID PHYSICS (Lines) ---
+                glBegin(GL_POINTS);
                 for (int l = 0; l < num_lines; ++l) {
-                    glBegin(GL_LINE_STRIP);
                     for (int p = 0; p < points_per_line; ++p) {
                         int i = l * points_per_line + p;
                         Particle* pt = &grid_particles[i];
@@ -469,8 +473,8 @@ int main(int argc, char** argv) {
                         // Radial Audio Displacement:
                         float radius = sqrtf(pt->x * pt->x + pt->z * pt->z);
                         
-                        // Max expected radius is roughly 300
-                        float max_radius_for_freq = 280.0f;
+                        // Map the full 512 visually active bands across the expansive 900x900 grid
+                        float max_radius_for_freq = 400.0f;
                         int band = (int)((radius / max_radius_for_freq) * display_bands);
                         if (band >= display_bands) band = display_bands - 1;
                         if (band < 0) band = 0;
@@ -536,14 +540,18 @@ int main(int argc, char** argv) {
                             col_b = (Uint8)(255 * (1.0f - peak_factor));
                         }
                         
-                        glColor4ub(col_r, col_g, col_b, (Uint8)(intensity * 255));
+                        // Simulated BLOOM via very dense stacking with low alpha
+                        Uint8 alpha = (Uint8)(intensity * 22.0f); // Exceptionally low base alpha (around ~10/255)
+                        if (alpha > 255) alpha = 255;
+                        
+                        glColor4ub(col_r, col_g, col_b, alpha);
                         glVertex3f(pt->x, pt->y, pt->z);
                     }
-                    glEnd();
                 }
+                glEnd();
                 
                 glDisable(GL_BLEND);
-                glDisable(GL_LINE_SMOOTH);
+                glDisable(GL_POINT_SMOOTH);
             } else if (current_mode_index == MODE_CHROMAGRAM) {
                 // =============== CHROMAGRAM VISUALIZER ===============
                 compute_chromagram(&audio_data.audio_data[sample_offset], num_frames_per_chunk, num_channels, chromagram, &chroma_pitches);
